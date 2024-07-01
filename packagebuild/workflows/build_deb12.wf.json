@@ -28,13 +28,14 @@
         "Path": "./build_package.wf.json",
         "Vars": {
           "type": "deb",
-          "sourceImage": "projects/bct-prod-images/global/images/family/debian-12",
+          "sourceImage": "projects/debian-cloud/global/images/family/debian-12",
           "gcs_path": "${gcs_path}",
           "repo_owner": "${repo_owner}",
           "repo_name": "${repo_name}",
           "git_ref": "${git_ref}",
           "build_dir": "${build_dir}",
           "version": "${version}"
+        }
       }
     }
   }

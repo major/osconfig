@@ -67,7 +67,7 @@ while true; do
   sleep 5
 done`
 
-		ss = fmt.Sprintf(ss, utils.InstallOSConfigDeb(), waitForRestartLinux, packageName, packageInstalled, packageNotInstalled)
+		ss = fmt.Sprintf(ss, utils.InstallOSConfigDeb(image), waitForRestartLinux, packageName, packageInstalled, packageNotInstalled)
 		key = "startup-script"
 
 	case "yum":
@@ -150,6 +150,11 @@ func getUpdateStartupScript(image, pkgManager string) *computeApi.MetadataItems 
 	case "apt":
 		ss = `
 echo 'Adding test repo'
+
+# install gnupg2 if not exist
+apt-get update
+apt-get install -y gnupg2
+
 echo 'deb http://packages.cloud.google.com/apt osconfig-agent-test-repository main' >> /etc/apt/sources.list
 curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
@@ -171,7 +176,7 @@ while true; do
   sleep 5;
 done`
 
-		ss = fmt.Sprintf(ss, utils.InstallOSConfigDeb(), waitForRestartLinux, packageInstalled, packageNotInstalled)
+		ss = fmt.Sprintf(ss, utils.InstallOSConfigDeb(image), waitForRestartLinux, packageInstalled, packageNotInstalled)
 		key = "startup-script"
 
 	case "yum":
@@ -304,7 +309,7 @@ while ($true) {
 	case "cos":
 		script = fmt.Sprintf("%s\n%s\n%s", utils.CurlPost, waitForRestartLinux, scriptLinux)
 	case "apt":
-		script = fmt.Sprintf("%s\n%s\n%s", utils.InstallOSConfigDeb(), waitForRestartLinux, scriptLinux)
+		script = fmt.Sprintf("%s\n%s\n%s", utils.InstallOSConfigDeb(image), waitForRestartLinux, scriptLinux)
 	case "yum":
 		script = fmt.Sprintf("%s\n%s\n%s", utils.InstallOSConfigEL(image), waitForRestartLinux, scriptLinux)
 	case "zypper":
@@ -397,7 +402,7 @@ while ($true) {
 	case "cos":
 		script = fmt.Sprintf("%s\n%s\n%s", utils.CurlPost, waitForRestartLinux, scriptLinux)
 	case "apt":
-		script = fmt.Sprintf("%s\n%s\n%s", utils.InstallOSConfigDeb(), waitForRestartLinux, scriptLinux)
+		script = fmt.Sprintf("%s\n%s\n%s", utils.InstallOSConfigDeb(image), waitForRestartLinux, scriptLinux)
 	case "yum":
 		// A dependancy package for ed-1.1-3.3.el6.x86_64.rpm which is used in Enterprise-Linux Recipe steps tests
 		yumInstallInfoPackage := fmt.Sprintf("\n%s\n", "yum install -y info")

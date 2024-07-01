@@ -17,6 +17,7 @@ package packages
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,8 +35,17 @@ var (
 	dpkgDeb   string
 	aptGet    string
 
-	dpkgInstallArgs   = []string{"--install"}
-	dpkgQueryArgs     = []string{"-W", "-f", "${Package} ${Architecture} ${Version} ${db:Status-Status}\n"}
+	dpkgInstallArgs          = []string{"--install"}
+	dpkgPackageFieldsMapping = map[string]string{
+		"package":        "${Package}",
+		"architecture":   "${Architecture}",
+		"version":        "${Version}",
+		"status":         "${db:Status-Status}",
+		"source_name":    "${source:Package}",
+		"source_version": "${source:Version}",
+	}
+
+	dpkgQueryArgs     = []string{"-W", "-f", formatFieldsMappingToFormattingString(dpkgPackageFieldsMapping)}
 	dpkgRepairArgs    = []string{"--configure", "-a"}
 	aptGetInstallArgs = []string{"install", "-y"}
 	aptGetRemoveArgs  = []string{"remove", "-y"}
@@ -341,39 +351,44 @@ func AptUpdate(ctx context.Context) ([]byte, error) {
 	return stdout, err
 }
 
-func parseInstalledDebpackages(data []byte) []*PkgInfo {
-	/*
-	   foo amd64 1.2.3-4 installed
-	   bar noarch 1.2.3-4 installed
-	   baz noarch 1.2.3-4 config-files
-	   ...
-	*/
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-
-	var pkgs []*PkgInfo
-	for _, ln := range lines {
-		pkg := strings.Fields(ln)
-		if len(pkg) != 4 {
-			continue
-		}
-
-		// Only report on installed packages.
-		if pkg[3] != "installed" {
-			continue
-		}
-
-		pkgs = append(pkgs, &PkgInfo{Name: pkg[0], Arch: osinfo.Architecture(pkg[1]), Version: pkg[2]})
-	}
-	return pkgs
-}
-
 // InstalledDebPackages queries for all installed deb packages.
 func InstalledDebPackages(ctx context.Context) ([]*PkgInfo, error) {
 	out, err := run(ctx, dpkgQuery, dpkgQueryArgs)
 	if err != nil {
 		return nil, err
 	}
-	return parseInstalledDebpackages(out), nil
+
+	return parseInstalledDebPackages(ctx, out), nil
+}
+
+func parseInstalledDebPackages(ctx context.Context, data []byte) []*PkgInfo {
+	/*
+		Each line contains an entry in a json format, keep in mind that whole output is not valid json.
+
+		{"package":"adduser","architecture":"all","version":"3.118ubuntu2","status":"installed","source_name":"adduser","source_version":"3.118ubuntu2"}
+		{"package":"apt-utils","architecture":"amd64","version":"2.0.10","status":"installed","source_name":"apt","source_version":"2.0.10"}
+		{"package":"git","architecture":"amd64","version":"1:2.25.1-1ubuntu3.12","status":"installed","source_name":"git","source_version":"1:2.25.1-1ubuntu3.12"}
+		...
+	*/
+	entries := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
+
+	var result []*PkgInfo
+	for _, entry := range entries {
+		var dpkg packageMetadata
+		if err := json.Unmarshal(entry, &dpkg); err != nil {
+			clog.Debugf(ctx, "unable to parse dpkg package info, err %s, raw - %s", err, string(entry))
+			continue
+		}
+
+		pkg := pkgInfoFromPackageMetadata(dpkg)
+		if dpkg.Status != "installed" {
+			continue
+		}
+
+		result = append(result, pkg)
+	}
+
+	return result
 }
 
 // DpkgInstall installs a deb package.

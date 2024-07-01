@@ -30,6 +30,8 @@ import (
 )
 
 var (
+	testingPkgsProjectName = "gce-pkg-osconfig-testing"
+
 	yumInstallAgent = `
 sed -i 's/repo_gpgcheck=1/repo_gpgcheck=0/g' /etc/yum.repos.d/google-cloud.repo
 sleep 10
@@ -83,43 +85,68 @@ Start-Sleep 10
 $uri = 'http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/osconfig_tests/install_done'
 Invoke-RestMethod -Method PUT -Uri $uri -Headers @{"Metadata-Flavor" = "Google"} -Body 1
 `
-
-	yumRepoSetup = `
-cat > /etc/yum.repos.d/google-osconfig-agent.repo <<EOM
-[google-osconfig-agent]
-name=Google OSConfig Agent Repository
-baseurl=https://packages.cloud.google.com/yum/repos/google-osconfig-agent-%s-%s
-enabled=1
-gpgcheck=%d
-gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
-           https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
-EOM`
-
-	zypperRepoSetup = `
-cat > /etc/zypp/repos.d/google-osconfig-agent.repo <<EOM
-[google-osconfig-agent]
-name=Google OSConfig Agent Repository
-baseurl=https://packages.cloud.google.com/yum/repos/google-osconfig-agent-%s-%s
-enabled=1
-gpgcheck=%d
-gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
-           https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
-EOM`
 )
 
+// getRegionFromZone extracts the region from a zone name.
+// Example: If zone is "us-central1-a", this would return "us-central1"
+func getRegionFromZone(zone string) string {
+	parts := strings.Split(zone, "-")
+	return strings.Join(parts[:len(parts)-1], "-")
+}
+
+// pickTestRegionForArtifactRegistry selects a random zone from the configured zones to pull osconfig-agent package from AR & selected-region
+func pickTestRegionForArtifactRegistry() string {
+	zones := config.Zones()
+
+	if len(zones) == 0 {
+		// default region for tests
+		return "us-central1"
+	}
+
+	zoneKeys := make([]string, 0, len(zones))
+	for k := range zones {
+		zoneKeys = append(zoneKeys, k)
+	}
+	randomIndex := rand.Intn(len(zoneKeys))
+	randomZone := zoneKeys[randomIndex]
+
+	return getRegionFromZone(randomZone)
+}
+
+// getRepoLineForApt returns the repo line that should be added to apt sources.list file
+func getRepoLineForApt(osName string) string {
+	repo := config.AgentRepo()
+	if repo == "testing" {
+		testRegion := pickTestRegionForArtifactRegistry()
+		return fmt.Sprintf("deb ar+https://%s-apt.pkg.dev/projects/%s google-osconfig-agent-%s-testing main",
+			testRegion, testingPkgsProjectName, osName)
+	}
+	return fmt.Sprintf("deb http://packages.cloud.google.com/apt google-osconfig-agent-%s-%s main", osName, repo)
+}
+
 // InstallOSConfigDeb installs the osconfig agent on deb based systems.
-func InstallOSConfigDeb() string {
+func InstallOSConfigDeb(image string) string {
 	if config.AgentRepo() == "" {
 		return CurlPost
 	}
+	osName := getDebOsName(image)
 	return fmt.Sprintf(`
 sleep 10
 systemctl stop google-osconfig-agent
-echo 'deb http://packages.cloud.google.com/apt google-osconfig-agent-%s main' >> /etc/apt/sources.list
+
+# install gnupg2 if not exist
+apt-get update
+apt-get install -y gnupg2
+
+# install apt-transport-artifact-registry
+apt-get install -y apt-transport-artifact-registry
+
+echo '%s' >> /etc/apt/sources.list
+
 curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
 apt-get update
 apt-get install -y google-osconfig-agent
-systemctl start google-osconfig-agent`+CurlPost, config.AgentRepo())
+systemctl start google-osconfig-agent`+CurlPost, getRepoLineForApt(osName))
 }
 
 // InstallOSConfigGooGet installs the osconfig agent on Windows systems.
@@ -127,26 +154,69 @@ func InstallOSConfigGooGet() string {
 	if config.AgentRepo() == "" {
 		return windowsPost
 	}
+	removeAgentCmd := `c:\programdata\googet\googet.exe -noconfirm remove google-osconfig-agent`
 	if config.AgentRepo() == "stable" {
-		return `
-c:\programdata\googet\googet.exe -noconfirm remove google-osconfig-agent
-c:\programdata\googet\googet.exe -noconfirm install google-osconfig-agent` + windowsPost
+		return fmt.Sprintf(`
+%s
+c:\programdata\googet\googet.exe -noconfirm install google-osconfig-agent`, removeAgentCmd) + windowsPost
+	} else if config.AgentRepo() == "testing" {
+		testRegion := pickTestRegionForArtifactRegistry()
+		agentRepo := config.AgentRepo()
+		return fmt.Sprintf(`
+%s
+c:\programdata\googet\googet.exe addrepo google-osconfig-agent-googet-testing https://%s-googet.pkg.dev/projects/%s/repos/google-osconfig-agent-googet-%s
+
+# set useoauth to true in repo new file
+$filePath = 'C:\ProgramData\GooGet\repos\google-osconfig-agent-googet-testing.repo'
+(Get-Content $filePath) -replace 'useoauth: false', 'useoauth: true' | Set-Content $filePath
+
+c:\programdata\googet\googet.exe -noconfirm install google-osconfig-agent`+windowsPost, removeAgentCmd, testRegion, testingPkgsProjectName, agentRepo)
 	}
 	return fmt.Sprintf(`
-c:\programdata\googet\googet.exe -noconfirm remove google-osconfig-agent
+%s
 c:\programdata\googet\googet.exe -noconfirm install -sources https://packages.cloud.google.com/yuck/repos/google-osconfig-agent-%s google-osconfig-agent
-`+windowsPost, config.AgentRepo())
+`+windowsPost, removeAgentCmd, config.AgentRepo())
 }
 
-// InstallOSConfigSUSE installs the osconfig agent on suse systems.
-func InstallOSConfigSUSE() string {
-	if config.AgentRepo() == "" {
-		return ""
+// getYumRepoBaseURL returns the repo baseUrl that should be added to repo file google-osconfig-agent.repo
+func getYumRepoBaseURL(osType string) string {
+	agentRepo := config.AgentRepo()
+	if agentRepo == "testing" {
+		testRegion := pickTestRegionForArtifactRegistry()
+		return fmt.Sprintf("https://%s-yum.pkg.dev/projects/%s/google-osconfig-agent-%s-testing", testRegion, testingPkgsProjectName, osType)
 	}
-	if config.AgentRepo() == "staging" || config.AgentRepo() == "stable" {
-		return fmt.Sprintf(zypperRepoSetup+zypperInstallAgent, "el8", config.AgentRepo(), 1)
+	return fmt.Sprintf("https://packages.cloud.google.com/yum/repos/google-osconfig-agent-%s-%s", osType, agentRepo)
+}
+
+func getYumRepoSetup(osType string) string {
+	gpgcheck := 0
+	if config.AgentRepo() == "staging" {
+		gpgcheck = 1
 	}
-	return fmt.Sprintf(zypperRepoSetup+zypperInstallAgent, "el8", config.AgentRepo(), 0)
+
+	// According to doc, pkg name differ according to ELv version
+	// doc: https://cloud.google.com/artifact-registry/docs/os-packages/rpm/configure#prepare-yum
+	format := "dnf"
+	if osType == "el7" {
+		format = "yum"
+	}
+
+	repoConfig := fmt.Sprintf(`
+# install yum-plugin-artifact-registry
+yum makecache
+yum install -y %s-plugin-artifact-registry
+
+cat > /etc/yum.repos.d/google-osconfig-agent.repo <<EOM
+[google-osconfig-agent]
+name=Google OSConfig Agent Repository
+baseurl=%s
+enabled=1
+gpgcheck=%d
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
+			https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOM`, format, getYumRepoBaseURL(osType), gpgcheck)
+
+	return repoConfig
 }
 
 // InstallOSConfigEL9 installs the osconfig agent on el9 based systems. (RHEL)
@@ -158,9 +228,9 @@ func InstallOSConfigEL9() string {
 		return yumInstallAgent
 	}
 	if config.AgentRepo() == "staging" {
-		return fmt.Sprintf(yumRepoSetup+yumInstallAgent, "el9", config.AgentRepo(), 1)
+		return getYumRepoSetup("el9") + yumInstallAgent
 	}
-	return fmt.Sprintf(yumRepoSetup+yumInstallAgent, "el9", config.AgentRepo(), 0)
+	return getYumRepoSetup("el9") + yumInstallAgent
 }
 
 // InstallOSConfigEL8 installs the osconfig agent on el8 based systems. (RHEL)
@@ -172,9 +242,9 @@ func InstallOSConfigEL8() string {
 		return yumInstallAgent
 	}
 	if config.AgentRepo() == "staging" {
-		return fmt.Sprintf(yumRepoSetup+yumInstallAgent, "el8", config.AgentRepo(), 1)
+		return getYumRepoSetup("el8") + yumInstallAgent
 	}
-	return fmt.Sprintf(yumRepoSetup+yumInstallAgent, "el8", config.AgentRepo(), 0)
+	return getYumRepoSetup("el8") + yumInstallAgent
 }
 
 // InstallOSConfigEL7 installs the osconfig agent on el7 based systems.
@@ -186,78 +256,147 @@ func InstallOSConfigEL7() string {
 		return yumInstallAgent
 	}
 	if config.AgentRepo() == "staging" {
-		return fmt.Sprintf(yumRepoSetup+yumInstallAgent, "el7", config.AgentRepo(), 1)
+		return getYumRepoSetup("el7") + yumInstallAgent
 	}
-	return fmt.Sprintf(yumRepoSetup+yumInstallAgent, "el7", config.AgentRepo(), 0)
+	return getYumRepoSetup("el7") + yumInstallAgent
+}
+
+// containsAnyOf checks if a string contains any substring from a given list.
+func containsAnyOf(str string, substrings []string) bool {
+	for _, substring := range substrings {
+		if strings.Contains(str, substring) {
+			return true
+		}
+	}
+	return false
 }
 
 // InstallOSConfigEL installs the osconfig agent on el based systems.
 func InstallOSConfigEL(image string) string {
+	imageName := path.Base(image)
 	switch {
-	case strings.Contains(path.Base(image), "9"):
+	case image == "9" || containsAnyOf(imageName, []string{"rhel-9", "rhel-sap-9", "centos-stream-9", "rocky-linux-9"}):
 		return InstallOSConfigEL9()
-	case strings.Contains(path.Base(image), "8"):
+	case image == "8" || containsAnyOf(imageName, []string{"rhel-8", "rhel-sap-8", "centos-stream-8", "rocky-linux-8"}):
 		return InstallOSConfigEL8()
-	case strings.Contains(path.Base(image), "7"):
+	case image == "7" || containsAnyOf(imageName, []string{"rhel-7", "rhel-sap-7", "centos-7"}):
 		return InstallOSConfigEL7()
 
 	}
 	return ""
 }
 
-// DowngradeAptImages is a single image that are used for testing downgrade case with apt-get
-var DowngradeAptImages = map[string]string{
+func getZypperRepoSetup(osType string) string {
+	gpgcheck := 0
+	if config.AgentRepo() == "staging" {
+		gpgcheck = 1
+	}
+
+	// TODO: Allow SUSE tests to pull packages from test project.
+	repoConfig := fmt.Sprintf(`
+cat > /etc/zypp/repos.d/google-osconfig-agent.repo <<EOM
+[google-osconfig-agent]
+name=Google OSConfig Agent Repository
+baseurl=%s
+enabled=1
+gpgcheck=%d
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
+			https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOM`, getYumRepoBaseURL(osType), gpgcheck)
+
+	return repoConfig
+}
+
+// InstallOSConfigSUSE installs the osconfig agent on suse systems.
+func InstallOSConfigSUSE() string {
+	if config.AgentRepo() == "" {
+		return ""
+	}
+	if config.AgentRepo() == "staging" || config.AgentRepo() == "stable" {
+		return getZypperRepoSetup("el8") + zypperInstallAgent
+	}
+	return getZypperRepoSetup("el8") + zypperInstallAgent
+}
+
+// getDebOsType returns the equivalent os_name for deb version (e.g. debian-11 --> bullseye)
+func getDebOsName(image string) string {
+	imageName := path.Base(image)
+	switch {
+	case image == "10" || containsAnyOf(imageName, []string{"debian-10", "buster"}):
+		return "buster"
+	case image == "11" || containsAnyOf(imageName, []string{"debian-11", "bullseye"}):
+		return "bullseye"
+	case image == "12" || containsAnyOf(imageName, []string{"debian-12", "bookworm"}):
+		return "bookworm"
+	}
+	return ""
+}
+
+// DowngradeBullseyeAptImages is a single image that are used for testing downgrade case with apt-get
+var DowngradeBullseyeAptImages = map[string]string{
 	"debian-cloud/debian-11": "projects/debian-cloud/global/images/debian-11-bullseye-v20231010",
 }
 
-// HeadAptImages is a map of names to image paths for public image families that use APT.
-var HeadAptImages = map[string]string{
+// HeadBusterAptImages empty for now as debian-10 wil reach EOL and some of its repos are not reachable anymore.
+var HeadBusterAptImages = map[string]string{
 	// Debian images.
-	"debian-cloud/debian-11": "projects/debian-cloud/global/images/debian-11-bullseye-v20231010",
-	"debian-cloud/debian-12": "projects/debian-cloud/global/images/debian-12-bookworm-v20231010",
-
-	// Ubuntu images.
-	"ubuntu-os-cloud/ubuntu-2314": "projects/ubuntu-os-cloud/global/images/ubuntu-2310-mantic-amd64-v20231011",
 }
 
-// OldAptImages is a map of names to image paths for old (deprecated) images that use APT.
-var OldAptImages = map[string]string{
+// HeadBullseyeAptImages is a map of names to image paths for public debian-11 images
+var HeadBullseyeAptImages = map[string]string{
 	// Debian images.
+	"debian-cloud/debian-11": "projects/debian-cloud/global/images/family/debian-11",
+}
 
-	// Ubuntu images.
-	"old/ubuntu-2004": "projects/ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20230918",
+// HeadBookwormAptImages is a map of names to image paths for public debian-12 images
+var HeadBookwormAptImages = map[string]string{
+	// Debian images.
+	"debian-cloud/debian-12": "projects/debian-cloud/global/images/family/debian-12",
 }
 
 // HeadSUSEImages is a map of names to image paths for public SUSE images.
-var HeadSUSEImages = map[string]string{
-	"suse-cloud/sles-12-sp5": "projects/suse-cloud/global/images/sles-12-sp5-v20230807-x86-64",
-	"suse-cloud/sles-15-sp5": "projects/suse-cloud/global/images/sles-15-sp5-v20230921-x86-64",
+var HeadSUSEImages = func() map[string]string {
+	imgsMap := make(map[string]string)
 
-	"suse-sap-cloud/sles-12-sp5-sap": "projects/suse-sap-cloud/global/images/sles-12-sp5-sap-v20231019-x86-64",
-	"suse-sap-cloud/sles-15-sp5-sap": "projects/suse-sap-cloud/global/images/sles-15-sp5-sap-v20230921-x86-64",
+	// TODO: enable SUSE tests to use testing pkgs after Artifact Registry supports zypper installation from private repos
+	if config.AgentRepo() != "testing" {
+		imgsMap = map[string]string{
+			"suse-cloud/sles-12-sp5": "projects/suse-cloud/global/images/family/sles-12",
+			"suse-cloud/sles-15-sp5": "projects/suse-cloud/global/images/family/sles-15",
 
-	"suse-sap-cloud/sles-15-sp4-hardened-sap": "projects/suse-sap-cloud/global/images/sles-sap-15-sp4-hardened-v20230828-x86-64",
-	"suse-sap-cloud/sles-15-sp5-hardened-sap": "projects/suse-sap-cloud/global/images/sles-sap-15-sp5-hardened-v20230921-x86-64",
+			"suse-sap-cloud/sles-12-sp5-sap": "projects/suse-sap-cloud/global/images/family/sles-12-sp5-sap",
+			"suse-sap-cloud/sles-15-sp5-sap": "projects/suse-sap-cloud/global/images/family/sles-15-sp5-sap",
 
-	"opensuse-cloud/opensuse-leap-15-4": "projects/opensuse-cloud/global/images/opensuse-leap-15-4-v20230907-x86-64",
-	"opensuse-cloud/opensuse-leap-15-5": "projects/opensuse-cloud/global/images/opensuse-leap-15-5-v20230908-x86-64",
-}
+			"suse-sap-cloud/sles-15-sp5-hardened-sap": "projects/suse-sap-cloud/global/images/family/sles-sap-15-sp5-hardened",
 
-// OldSUSEImages is a map of names to image paths for old SUSE images.
-var OldSUSEImages = map[string]string{
-	"old/sles-15-sp1-sap": "projects/suse-sap-cloud/global/images/sles-15-sp1-sap-v20221108-x86-64",
-	"old/sles-15-sp2-sap": "projects/suse-sap-cloud/global/images/sles-15-sp2-sap-v20221108-x86-64",
-	"old/sles-15-sp3-sap": "projects/suse-sap-cloud/global/images/sles-15-sp3-sap-v20221108-x86-64",
-	"old/sles-15-sp4-sap": "projects/suse-sap-cloud/global/images/sles-15-sp4-sap-v20230623-x86-64",
-}
+			"opensuse-cloud/opensuse-leap-15": "projects/opensuse-cloud/global/images/family/opensuse-leap",
+		}
+	}
+	return imgsMap
+}()
+
+// OldSUSEImages is a map of names to image paths for public SUSE images.
+var OldSUSEImages = func() map[string]string {
+	imgsMap := make(map[string]string)
+
+	// TODO: enable SUSE tests to use testing pkgs after Artifact Registry supports zypper installation from private repos
+	if config.AgentRepo() != "testing" {
+		imgsMap = map[string]string{
+			"old/sles-15-sp2-sap": "projects/suse-sap-cloud/global/images/sles-15-sp2-sap-v20231214-x86-64",
+			"old/sles-15-sp3-sap": "projects/suse-sap-cloud/global/images/sles-15-sp3-sap-v20231214-x86-64",
+			"old/sles-15-sp4-sap": "projects/suse-sap-cloud/global/images/sles-15-sp4-sap-v20240208-x86-64",
+		}
+	}
+	return imgsMap
+}()
 
 // HeadEL7Images is a map of names to image paths for public EL7 image families. (RHEL, CentOS)
 var HeadEL7Images = map[string]string{
-	"centos-cloud/centos-7": "projects/centos-cloud/global/images/centos-7-v20231010",
+	"centos-cloud/centos-7": "projects/centos-cloud/global/images/family/centos-7",
 
-	"rhel-cloud/rhel-7": "projects/rhel-cloud/global/images/rhel-7-v20231010",
+	"rhel-cloud/rhel-7": "projects/rhel-cloud/global/images/family/rhel-7",
 
-	"rhel-sap-cloud/rhel-7-sap": "projects/rhel-sap-cloud/global/images/rhel-7-9-sap-v20231011",
+	"rhel-sap-cloud/rhel-7-9-sap": "projects/rhel-sap-cloud/global/images/family/rhel-7-9-sap-ha",
 }
 
 // OldEL7Images is a map of names to image paths for old EL7 images.
@@ -267,18 +406,14 @@ var OldEL7Images = map[string]string{
 
 // HeadEL8Images is a map of names to image paths for public EL8 image families. (RHEL, CentOS, Rocky)
 var HeadEL8Images = map[string]string{
-	"centos-cloud/centos-stream-8": "projects/centos-cloud/global/images/centos-stream-8-v20231010",
+	"rhel-cloud/rhel-8": "projects/rhel-cloud/global/images/family/rhel-8",
 
-	"rhel-cloud/rhel-8": "projects/rhel-cloud/global/images/rhel-8-v20231010",
+	"rhel-sap-cloud/rhel-8-4-sap": "projects/rhel-sap-cloud/global/images/family/rhel-8-4-sap-ha",
+	"rhel-sap-cloud/rhel-8-6-sap": "projects/rhel-sap-cloud/global/images/family/rhel-8-6-sap-ha",
+	"rhel-sap-cloud/rhel-8-8-sap": "projects/rhel-sap-cloud/global/images/family/rhel-8-8-sap-ha",
 
-	"rhel-sap-cloud/rhel-8-1-sap": "projects/rhel-sap-cloud/global/images/rhel-8-1-sap-v20231010",
-	"rhel-sap-cloud/rhel-8-2-sap": "projects/rhel-sap-cloud/global/images/rhel-8-2-sap-v20231010",
-	"rhel-sap-cloud/rhel-8-4-sap": "projects/rhel-sap-cloud/global/images/rhel-8-4-sap-v20231010",
-	"rhel-sap-cloud/rhel-8-6-sap": "projects/rhel-sap-cloud/global/images/rhel-8-6-sap-v20231010",
-	"rhel-sap-cloud/rhel-8-8-sap": "projects/rhel-sap-cloud/global/images/rhel-8-8-sap-v20231010",
-
-	"rocky-linux-cloud/rocky-linux-8":         "projects/rocky-linux-cloud/global/images/rocky-linux-8-v20231010",
-	"rocky-linux-cloud/rocky-linux-8-opt-gcp": "projects/rocky-linux-cloud/global/images/rocky-linux-8-optimized-gcp-v20231010",
+	"rocky-linux-cloud/rocky-linux-8":               "projects/rocky-linux-cloud/global/images/family/rocky-linux-8",
+	"rocky-linux-cloud/rocky-linux-8-optimized-gcp": "projects/rocky-linux-cloud/global/images/family/rocky-linux-8-optimized-gcp",
 }
 
 // OldEL8Images is a map of names to image paths for old EL8 images. (RHEL, CentOS, Rocky)
@@ -288,15 +423,15 @@ var OldEL8Images = map[string]string{
 
 // HeadEL9Images is a map of names to image paths for public EL9 image families. (RHEL, CentOS, Rocky)
 var HeadEL9Images = map[string]string{
-	"centos-cloud/centos-stream-9": "projects/centos-cloud/global/images/centos-stream-9-v20231010",
+	"centos-cloud/centos-stream-9": "projects/centos-cloud/global/images/family/centos-stream-9",
 
-	"rhel-cloud/rhel-9": "projects/rhel-cloud/global/images/rhel-9-v20231010",
+	"rhel-cloud/rhel-9": "projects/rhel-cloud/global/images/family/rhel-9",
 
-	"rhel-sap-cloud/rhel-9-0-sap": "projects/rhel-sap-cloud/global/images/rhel-9-0-sap-v20231010",
-	"rhel-sap-cloud/rhel-9-2-sap": "projects/rhel-sap-cloud/global/images/rhel-9-2-sap-v20231010",
+	"rhel-sap-cloud/rhel-9-0-sap": "projects/rhel-sap-cloud/global/images/family/rhel-9-0-sap-ha",
+	"rhel-sap-cloud/rhel-9-2-sap": "projects/rhel-sap-cloud/global/images/family/rhel-9-2-sap-ha",
 
-	"rocky-linux-cloud/rocky-linux-9":         "projects/rocky-linux-cloud/global/images/rocky-linux-9-v20231010",
-	"rocky-linux-cloud/rocky-linux-9-opt-gcp": "projects/rocky-linux-cloud/global/images/rocky-linux-9-optimized-gcp-v20231010",
+	"rocky-linux-cloud/rocky-linux-9":               "projects/rocky-linux-cloud/global/images/family/rocky-linux-9",
+	"rocky-linux-cloud/rocky-linux-9-optimized-gcp": "projects/rocky-linux-cloud/global/images/family/rocky-linux-9-optimized-gcp",
 }
 
 // OldEL9Images is a map of names to image paths for old EL9 images. (RHEL, CentOS, Rocky)
@@ -319,18 +454,34 @@ var HeadELImages = func() (newMap map[string]string) {
 	return
 }()
 
+// HeadAptImages is a map of names to image paths for public EL image families. (RHEL, CentOS, Rocky)
+var HeadAptImages = func() (newMap map[string]string) {
+	newMap = make(map[string]string)
+	for k, v := range HeadBusterAptImages {
+		newMap[k] = v
+	}
+	for k, v := range HeadBullseyeAptImages {
+		newMap[k] = v
+	}
+	for k, v := range HeadBookwormAptImages {
+		newMap[k] = v
+	}
+	return
+}()
+
 // HeadWindowsImages is a map of names to image paths for public Windows image families.
 var HeadWindowsImages = map[string]string{
-	"windows-cloud/win-2016-dc-core": "projects/windows-cloud/global/images/windows-server-2016-dc-core-v20231011",
-	"windows-cloud/win-2016-dc":      "projects/windows-cloud/global/images/windows-server-2016-dc-v20231011",
-	"windows-cloud/win-2019-dc-core": "projects/windows-cloud/global/images/windows-server-2019-dc-core-v20231011",
-	"windows-cloud/win-2019-dc":      "projects/windows-cloud/global/images/windows-server-2019-dc-v20231011",
+	"windows-cloud/windows-2016":      "projects/windows-cloud/global/images/family/windows-2016",
+	"windows-cloud/windows-2016-core": "projects/windows-cloud/global/images/family/windows-2016-core",
+	"windows-cloud/windows-2019":      "projects/windows-cloud/global/images/family/windows-2019",
+	"windows-cloud/windows-2019-core": "projects/windows-cloud/global/images/family/windows-2019-core",
 
 	// Testing of win-2022-dc disabled because of https://techcommunity.microsoft.com/t5/windows-server-for-it-pro/faulty-patches-on-server-2022/m-p/4028125
 
 	/*
-		"windows-cloud/win-2022-dc-core": "projects/windows-cloud/global/images/windows-server-2022-dc-core-v20231011",
-		"windows-cloud/win-2022-dc":      "projects/windows-cloud/global/images/windows-server-2022-dc-v20231011", */
+		"windows-cloud/windows-2022":         "projects/windows-cloud/global/images/family/windows-2022",
+		"windows-cloud/windows-2022-core":    "projects/windows-cloud/global/images/family/windows-2022-core",
+	*/
 }
 
 // OldWindowsImages is a map of names to image paths for old Windows images.
@@ -340,9 +491,9 @@ var OldWindowsImages = map[string]string{
 
 // HeadCOSImages is a map of names to image paths for public COS image families.
 var HeadCOSImages = map[string]string{
-	"cos-cloud/cos-stable": "projects/cos-cloud/global/images/cos-stable-109-17800-0-51",
-	"cos-cloud/cos-beta":   "projects/cos-cloud/global/images/cos-beta-109-17800-0-51",
-	"cos-cloud/cos-dev":    "projects/cos-cloud/global/images/cos-dev-113-17965-0-0",
+	"cos-cloud/cos-stable": "projects/cos-cloud/global/images/family/cos-stable",
+	"cos-cloud/cos-beta":   "projects/cos-cloud/global/images/family/cos-beta",
+	"cos-cloud/cos-dev":    "projects/cos-cloud/global/images/family/cos-dev",
 }
 
 // RandString generates a random string of n length.
